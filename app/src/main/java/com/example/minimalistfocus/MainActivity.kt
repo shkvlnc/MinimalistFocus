@@ -1,136 +1,149 @@
 
 package com.example.minimalistfocus
 
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
-import org.json.JSONArray
-import org.json.JSONObject
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Checkbox
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import java.time.LocalDate
-import java.time.LocalTime
-import java.time.format.DateTimeFormatter
+import androidx.compose.ui.window.Dialog
+import kotlinx.coroutines.delay
+import org.json.JSONArray
+import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
-private val Ink = Color(0xFF171717)
-private val Paper = Color(0xFFFAF9F5)
-private val Muted = Color(0xFF737373)
-private val Rule = Color(0xFFD6D4CC)
+private val Paper = Color(0xFFFFFFFF)
+private val Ink = Color(0xFF202020)
+private val Muted = Color(0xFF777777)
+private val Rule = Color(0xFFE0E0E0)
 
 private enum class EntryType { TASK, NOTE, EVENT }
+private enum class TaskStatus { INBOX, NEXT, SCHEDULED, WAITING, DONE }
+private enum class Page { JOURNAL, TASKS, PROJECTS, HISTORY }
 
-private data class SubEntry(
-    val id: Int,
+private data class ChildEntry(
+    val id: Long = System.nanoTime(),
     val text: String,
-    val isTask: Boolean,
     val done: Boolean = false
 )
 
-private data class JournalEntry(
-    val id: Int,
-    val date: String,
-    val time: String,
-    val type: EntryType,
+private data class Entry(
+    val id: Long = System.nanoTime(),
+    val date: String = today(),
+    val time: String = nowTime(),
+    val type: EntryType = EntryType.TASK,
     val text: String,
+    val details: String = "",
     val done: Boolean = false,
-    val children: List<SubEntry> = emptyList()
+    val status: TaskStatus = TaskStatus.INBOX,
+    val scheduledDate: String = "",
+    val project: String = "",
+    val children: List<ChildEntry> = emptyList()
 )
 
-private const val PREFS_NAME = "minimalist_focus_v2"
-private const val ENTRIES_KEY = "journal_entries"
-private const val NEXT_ID_KEY = "next_entry_id"
+private fun today(): String =
+    SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
 
-private fun currentTime(): String =
-    LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm"))
+private fun nowTime(): String =
+    SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
 
-private fun currentDate(): String = LocalDate.now().toString()
-
-private fun encodeEntries(entries: List<JournalEntry>): String {
-    val array = JSONArray()
-
-    entries.forEach { entry ->
-        val obj = JSONObject()
-        obj.put("id", entry.id)
-        obj.put("date", entry.date)
-        obj.put("time", entry.time)
-        obj.put("type", entry.type.name)
-        obj.put("text", entry.text)
-        obj.put("done", entry.done)
-
-        val children = JSONArray()
-        entry.children.forEach { child ->
-            val childObj = JSONObject()
-            childObj.put("id", child.id)
-            childObj.put("text", child.text)
-            childObj.put("isTask", child.isTask)
-            childObj.put("done", child.done)
-            children.put(childObj)
-        }
-
-        obj.put("children", children)
-        array.put(obj)
-    }
-
-    return array.toString()
+private fun displayDate(date: String): String = try {
+    SimpleDateFormat("EEE, MMM d", Locale.getDefault()).format(
+        SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).parse(date)!!
+    )
+} catch (_: Exception) {
+    date
 }
 
-private fun decodeEntries(json: String): List<JournalEntry> {
-    return try {
-        val array = JSONArray(json)
-        val result = mutableListOf<JournalEntry>()
+private const val PREFS = "minimalist_focus_v2_scratch"
+private const val DATA_KEY = "entries_json"
 
-        for (i in 0 until array.length()) {
-            val obj = array.getJSONObject(i)
-            val childrenArray = obj.optJSONArray("children") ?: JSONArray()
-            val children = mutableListOf<SubEntry>()
-
-            for (j in 0 until childrenArray.length()) {
-                val child = childrenArray.getJSONObject(j)
-                children.add(
-                    SubEntry(
-                        id = child.optInt("id"),
-                        text = child.optString("text"),
-                        isTask = child.optBoolean("isTask"),
-                        done = child.optBoolean("done")
-                    )
-                )
-            }
-
-            result.add(
-                JournalEntry(
-                    id = obj.optInt("id"),
-                    date = obj.optString("date", currentDate()),
-                    time = obj.optString("time"),
-                    type = EntryType.valueOf(obj.optString("type")),
-                    text = obj.optString("text"),
-                    done = obj.optBoolean("done"),
-                    children = children
-                )
+private fun encode(entries: List<Entry>): String {
+    val array = JSONArray()
+    entries.forEach { e ->
+        val children = JSONArray()
+        e.children.forEach { c ->
+            children.put(
+                JSONObject()
+                    .put("id", c.id)
+                    .put("text", c.text)
+                    .put("done", c.done)
             )
         }
 
-        result
+        array.put(
+            JSONObject()
+                .put("id", e.id)
+                .put("date", e.date)
+                .put("time", e.time)
+                .put("type", e.type.name)
+                .put("text", e.text)
+                .put("details", e.details)
+                .put("done", e.done)
+                .put("status", e.status.name)
+                .put("scheduledDate", e.scheduledDate)
+                .put("project", e.project)
+                .put("children", children)
+        )
+    }
+    return array.toString()
+}
+
+private fun decode(json: String?): List<Entry> {
+    if (json.isNullOrBlank()) return emptyList()
+
+    return try {
+        val array = JSONArray(json)
+        List(array.length()) { i ->
+            val o = array.getJSONObject(i)
+            val childrenJson = o.optJSONArray("children") ?: JSONArray()
+            val children = List(childrenJson.length()) { j ->
+                val c = childrenJson.getJSONObject(j)
+                ChildEntry(
+                    id = c.optLong("id", System.nanoTime()),
+                    text = c.optString("text"),
+                    done = c.optBoolean("done")
+                )
+            }
+
+            Entry(
+                id = o.optLong("id", System.nanoTime()),
+                date = o.optString("date", today()),
+                time = o.optString("time", nowTime()),
+                type = runCatching {
+                    EntryType.valueOf(o.optString("type", "TASK"))
+                }.getOrDefault(EntryType.TASK),
+                text = o.optString("text"),
+                details = o.optString("details"),
+                done = o.optBoolean("done"),
+                status = runCatching {
+                    TaskStatus.valueOf(o.optString("status", "INBOX"))
+                }.getOrDefault(TaskStatus.INBOX),
+                scheduledDate = o.optString("scheduledDate"),
+                project = o.optString("project"),
+                children = children
+            )
+        }
     } catch (_: Exception) {
         emptyList()
     }
@@ -140,622 +153,845 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        window.statusBarColor = android.graphics.Color.WHITE
+        window.navigationBarColor = android.graphics.Color.WHITE
+        window.decorView.systemUiVisibility =
+            android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or
+                    android.view.View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+
         setContent {
-            MaterialTheme {
+            MaterialTheme(
+                colorScheme = lightColorScheme(
+                    background = Paper,
+                    surface = Paper,
+                    primary = Ink,
+                    onPrimary = Paper,
+                    onSurface = Ink,
+                    onBackground = Ink
+                )
+            ) {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = Paper
                 ) {
-                    MinimalistFocusApp(applicationContext)
+                    MinimalistFocus()
                 }
             }
         }
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun MinimalistFocusApp(context: Context) {
+private fun MinimalistFocus() {
+    val context = LocalContext.current
     val prefs = remember {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
     }
 
     var entries by remember {
-        mutableStateOf(
-            decodeEntries(prefs.getString(ENTRIES_KEY, "[]") ?: "[]")
+        mutableStateOf(decode(prefs.getString(DATA_KEY, null)))
+    }
+    var page by remember { mutableStateOf(Page.JOURNAL) }
+    var taskFilter by remember { mutableStateOf(TaskStatus.INBOX) }
+    var showEditor by remember { mutableStateOf(false) }
+    var editing by remember { mutableStateOf<Entry?>(null) }
+    var parentForChild by remember { mutableStateOf<Entry?>(null) }
+    var actionEntry by remember { mutableStateOf<Entry?>(null) }
+    var deleteEntry by remember { mutableStateOf<Entry?>(null) }
+    var showMove by remember { mutableStateOf<Entry?>(null) }
+    var showApps by remember { mutableStateOf(false) }
+    var searchText by remember { mutableStateOf("") }
+    var completedExpanded by remember { mutableStateOf(false) }
+    var pomodoroEntry by remember { mutableStateOf<Entry?>(null) }
+    var secondsLeft by remember { mutableIntStateOf(25 * 60) }
+    var timerRunning by remember { mutableStateOf(false) }
+
+    fun save(updated: List<Entry>) {
+        entries = updated
+        prefs.edit().putString(DATA_KEY, encode(updated)).apply()
+    }
+
+    fun upsert(entry: Entry) {
+        save(
+            if (entries.any { it.id == entry.id }) {
+                entries.map { if (it.id == entry.id) entry else it }
+            } else {
+                entries + entry
+            }
         )
     }
 
-    var nextId by remember {
-        mutableIntStateOf(
-            maxOf(
-                prefs.getInt(NEXT_ID_KEY, 1),
-                (entries.maxOfOrNull { it.id } ?: 0) + 1,
-                (entries.flatMap { it.children }.maxOfOrNull { it.id } ?: 0) + 1
+    fun toggleDone(entry: Entry) {
+        upsert(
+            entry.copy(
+                done = !entry.done,
+                status = if (!entry.done) TaskStatus.DONE
+                else TaskStatus.NEXT
             )
         )
     }
 
-    var currentPage by remember { mutableStateOf("Journal") }
-    var expandedEntries by remember { mutableStateOf(setOf<Int>()) }
-    var showAddDialog by remember { mutableStateOf(false) }
-    var addType by remember { mutableStateOf(EntryType.NOTE) }
-    var parentForChild by remember { mutableStateOf<Int?>(null) }
-    var showSearch by remember { mutableStateOf(false) }
-    var searchQuery by remember { mutableStateOf("") }
-
-    fun saveEntries(updated: List<JournalEntry>) {
-        entries = updated
-        prefs.edit()
-            .putString(ENTRIES_KEY, encodeEntries(updated))
-            .putInt(NEXT_ID_KEY, nextId)
-            .apply()
+    LaunchedEffect(timerRunning, secondsLeft) {
+        if (timerRunning && secondsLeft > 0) {
+            delay(1000)
+            secondsLeft--
+        } else if (secondsLeft == 0) {
+            timerRunning = false
+        }
     }
 
-    fun addEntry(text: String, type: EntryType) {
-        val entry = JournalEntry(
-            id = nextId++,
-            date = currentDate(),
-            time = currentTime(),
-            type = type,
-            text = text
-        )
-        saveEntries(listOf(entry) + entries)
-    }
+    val todayEntries = entries
+        .filter { it.date == today() }
+        .sortedBy { it.time }
 
-    val dateText = LocalDate.now().format(
-        DateTimeFormatter.ofPattern("EEEE, MMMM d", Locale.getDefault())
-    )
+    val taskEntries = entries.filter { it.type == EntryType.TASK }
+    val visibleTasks = taskEntries.filter { it.status == taskFilter }
+    val projects = taskEntries.map { it.project.trim() }
+        .filter { it.isNotBlank() }.distinct().sorted()
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(Paper)
-            .statusBarsPadding()
-            .navigationBarsPadding()
-            .padding(horizontal = 22.dp)
-            .padding(top = 18.dp, bottom = 10.dp)
+            .padding(horizontal = 20.dp)
     ) {
+        Spacer(Modifier.height(12.dp))
+
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Column {
-                Text(
-                    "MinimalistFocus",
-                    fontSize = 24.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Ink
-                )
-                Text(dateText, fontSize = 13.sp, color = Muted)
-            }
+            Text(
+                "MinimalistFocus",
+                fontSize = 17.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = (-0.5).sp
+            )
 
-            TextButton(onClick = { showSearch = true }) {
-                Text("⌕", fontSize = 30.sp, color = Ink)
+            TextButton(onClick = { showApps = true }) {
+                Text("⌕", fontSize = 25.sp, color = Ink)
             }
         }
-
-        Spacer(Modifier.height(14.dp))
-        DividerLine()
-        Spacer(Modifier.height(12.dp))
-
-        Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-            NotebookTab("JOURNAL", currentPage == "Journal") {
-                currentPage = "Journal"
-            }
-            NotebookTab("TASKS", currentPage == "Tasks") {
-                currentPage = "Tasks"
-            }
-        }
-
-        Spacer(Modifier.height(12.dp))
-
-        if (currentPage == "Journal") {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    "TODAY'S ENTRIES",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 1.4.sp,
-                    color = Muted
-                )
-                TextButton(onClick = {
-                    parentForChild = null
-                    addType = EntryType.NOTE
-                    showAddDialog = true
-                }) {
-                    Text("+ Add entry", color = Ink)
-                }
-            }
-
-            val todaysEntries = entries.filter { it.date == currentDate() }
-
-            LazyColumn(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(0.dp)
-            ) {
-                items(todaysEntries, key = { it.id }) { entry ->
-                    JournalEntryRow(
-                        entry = entry,
-                        expanded = entry.id in expandedEntries,
-                        onToggleDone = {
-                            saveEntries(entries.map {
-                                if (it.id == entry.id) it.copy(done = !it.done)
-                                else it
-                            })
-                        },
-                        onExpand = {
-                            expandedEntries =
-                                if (entry.id in expandedEntries) {
-                                    expandedEntries - entry.id
-                                } else {
-                                    expandedEntries + entry.id
-                                }
-                        },
-                        onAddChild = {
-                            parentForChild = entry.id
-                            addType = EntryType.NOTE
-                            showAddDialog = true
-                        },
-                        onToggleChild = { child ->
-                            saveEntries(entries.map { parent ->
-                                if (parent.id == entry.id) {
-                                    parent.copy(
-                                        children = parent.children.map {
-                                            if (it.id == child.id) {
-                                                it.copy(done = !it.done)
-                                            } else it
-                                        }
-                                    )
-                                } else parent
-                            })
-                        }
-                    )
-                    DividerLine()
-                }
-
-                item {
-                    if (todaysEntries.isEmpty()) {
-                        Text(
-                            "A blank page. Start with one honest entry.",
-                            fontSize = 14.sp,
-                            color = Muted,
-                            modifier = Modifier.padding(vertical = 24.dp)
-                        )
-                    }
-
-                    Spacer(Modifier.height(14.dp))
-                    Text(
-                        "Every entry is a record of where your attention went.",
-                        fontSize = 12.sp,
-                        lineHeight = 18.sp,
-                        color = Muted,
-                        modifier = Modifier.padding(vertical = 10.dp)
-                    )
-                }
-            }
-        } else {
-            val tasks = entries.filter { it.type == EntryType.TASK }
-            val pending = tasks.filterNot { it.done }
-            val completed = tasks.filter { it.done }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    "YOUR TASKS",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 1.4.sp,
-                    color = Muted
-                )
-                TextButton(onClick = {
-                    addType = EntryType.TASK
-                    parentForChild = null
-                    showAddDialog = true
-                }) {
-                    Text("+ Add task", color = Ink)
-                }
-            }
-
-            LazyColumn(modifier = Modifier.weight(1f)) {
-                item {
-                    Text(
-                        "PENDING (${pending.size})",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Muted,
-                        modifier = Modifier.padding(vertical = 10.dp)
-                    )
-                }
-
-                items(pending, key = { it.id }) { task ->
-                    TaskRow(task) {
-                        saveEntries(entries.map {
-                            if (it.id == task.id) it.copy(done = true) else it
-                        })
-                    }
-                }
-
-                item {
-                    Text(
-                        "COMPLETED (${completed.size})",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Muted,
-                        modifier = Modifier.padding(vertical = 12.dp)
-                    )
-                }
-
-                items(completed, key = { it.id }) { task ->
-                    TaskRow(task) {
-                        saveEntries(entries.map {
-                            if (it.id == task.id) it.copy(done = false) else it
-                        })
-                    }
-                }
-            }
-        }
-
-        Spacer(Modifier.height(10.dp))
-        DividerLine()
-        Spacer(Modifier.height(10.dp))
 
         Text(
-            "FOCUS ON WHAT MATTERS",
-            fontSize = 10.sp,
-            letterSpacing = 1.5.sp,
+            when (page) {
+                Page.JOURNAL -> "Journal"
+                Page.TASKS -> "Tasks"
+                Page.PROJECTS -> "Projects"
+                Page.HISTORY -> "History"
+            },
+            fontSize = 30.sp,
+            fontWeight = FontWeight.Bold
+        )
+
+        Text(
+            when (page) {
+                Page.JOURNAL -> displayDate(today())
+                Page.TASKS -> "Organize what needs doing"
+                Page.PROJECTS -> "${projects.size} projects"
+                Page.HISTORY -> "Past entries and completed tasks"
+            },
+            fontSize = 12.sp,
             color = Muted
         )
-    }
 
-    if (showAddDialog) {
-        AddEntryDialog(
-            title = if (parentForChild != null) "Add sub-entry" else when (addType) {
-                EntryType.TASK -> "New task"
-                EntryType.NOTE -> "New note"
-                EntryType.EVENT -> "New event"
-            },
-            initialType = addType,
-            showTypePicker = parentForChild == null,
-            onDismiss = {
-                showAddDialog = false
-                parentForChild = null
-            },
-            onSave = { text, selectedType ->
-                val parentId = parentForChild
+        Spacer(Modifier.height(14.dp))
+        HorizontalDivider(color = Rule)
+        Spacer(Modifier.height(8.dp))
 
-                if (parentId == null) {
-                    addEntry(text, selectedType)
-                } else {
-                    saveEntries(entries.map { parent ->
-                        if (parent.id == parentId) {
-                            parent.copy(
-                                children = parent.children + SubEntry(
-                                    id = nextId++,
-                                    text = text,
-                                    isTask = selectedType == EntryType.TASK
-                                )
-                            )
-                        } else parent
-                    })
-                    expandedEntries = expandedEntries + parentId
+        when (page) {
+            Page.JOURNAL -> {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("TODAY", fontSize = 11.sp, letterSpacing = 1.5.sp,
+                        fontWeight = FontWeight.Bold, color = Muted)
+                    TextButton(onClick = {
+                        editing = null
+                        showEditor = true
+                    }) {
+                        Text("+ Add entry", color = Ink)
+                    }
                 }
 
-                showAddDialog = false
+                LazyColumn(modifier = Modifier.weight(1f)) {
+                    items(todayEntries, key = { it.id }) { entry ->
+                        JournalRow(
+                            entry = entry,
+                            onClick = {
+                                if (entry.type == EntryType.TASK) {
+                                    toggleDone(entry)
+                                }
+                            },
+                            onLongClick = { actionEntry = entry },
+                            onChildToggle = { child ->
+                                upsert(
+                                    entry.copy(
+                                        children = entry.children.map {
+                                            if (it.id == child.id)
+                                                it.copy(done = !it.done)
+                                            else it
+                                        }
+                                    )
+                                )
+                            },
+                            onPomodoro = {
+                                pomodoroEntry = entry
+                                secondsLeft = 25 * 60
+                                timerRunning = false
+                            }
+                        )
+                    }
+                }
+            }
+
+            Page.TASKS -> {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    listOf(
+                        TaskStatus.INBOX, TaskStatus.NEXT,
+                        TaskStatus.SCHEDULED, TaskStatus.WAITING,
+                        TaskStatus.DONE
+                    ).forEach { status ->
+                        val label = when (status) {
+                            TaskStatus.INBOX -> "Inbox"
+                            TaskStatus.NEXT -> "Next"
+                            TaskStatus.SCHEDULED -> "Later"
+                            TaskStatus.WAITING -> "Waiting"
+                            TaskStatus.DONE -> "Done"
+                        }
+                        FilterChip(
+                            selected = taskFilter == status,
+                            onClick = { taskFilter = status },
+                            label = { Text(label, fontSize = 10.sp) }
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(8.dp))
+
+                LazyColumn(modifier = Modifier.weight(1f)) {
+                    items(visibleTasks, key = { it.id }) { entry ->
+                        JournalRow(
+                            entry = entry,
+                            onClick = { toggleDone(entry) },
+                            onLongClick = { actionEntry = entry },
+                            onChildToggle = { child ->
+                                upsert(entry.copy(children = entry.children.map {
+                                    if (it.id == child.id) it.copy(done = !it.done)
+                                    else it
+                                }))
+                            },
+                            onPomodoro = {
+                                pomodoroEntry = entry
+                                secondsLeft = 25 * 60
+                                timerRunning = false
+                            }
+                        )
+                    }
+                }
+            }
+
+            Page.PROJECTS -> {
+                LazyColumn(modifier = Modifier.weight(1f)) {
+                    items(projects) { project ->
+                        val projectTasks = taskEntries.filter { it.project == project }
+                        val completed = projectTasks.count { it.status == TaskStatus.DONE }
+
+                        Column(Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
+                            Text(project, fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                "$completed of ${projectTasks.size} tasks completed",
+                                fontSize = 12.sp,
+                                color = Muted
+                            )
+                            LinearProgressIndicator(
+                                progress = {
+                                    if (projectTasks.isEmpty()) 0f
+                                    else completed.toFloat() / projectTasks.size
+                                },
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                color = Ink,
+                                trackColor = Rule
+                            )
+                            projectTasks.filter { it.status != TaskStatus.DONE }
+                                .forEach { entry ->
+                                    JournalRow(
+                                        entry = entry,
+                                        onClick = { toggleDone(entry) },
+                                        onLongClick = { actionEntry = entry },
+                                        onChildToggle = { child ->
+                                            upsert(entry.copy(children = entry.children.map {
+                                                if (it.id == child.id) it.copy(done = !it.done)
+                                                else it
+                                            }))
+                                        },
+                                        onPomodoro = {
+                                            pomodoroEntry = entry
+                                            secondsLeft = 25 * 60
+                                        }
+                                    )
+                                }
+                            HorizontalDivider(color = Rule)
+                        }
+                    }
+                }
+                Text(
+                    "Projects are created by assigning a project name when editing a task.",
+                    fontSize = 11.sp,
+                    color = Muted
+                )
+            }
+
+            Page.HISTORY -> {
+                val history = entries.filter {
+                    it.date != today() || it.status == TaskStatus.DONE
+                }.sortedByDescending { it.date + it.time }
+
+                LazyColumn(modifier = Modifier.weight(1f)) {
+                    items(history, key = { it.id }) { entry ->
+                        JournalRow(
+                            entry = entry,
+                            onClick = { toggleDone(entry) },
+                            onLongClick = { actionEntry = entry },
+                            onChildToggle = { child ->
+                                upsert(entry.copy(children = entry.children.map {
+                                    if (it.id == child.id) it.copy(done = !it.done)
+                                    else it
+                                }))
+                            },
+                            onPomodoro = {
+                                pomodoroEntry = entry
+                                secondsLeft = 25 * 60
+                            }
+                        )
+                    }
+                }
+            }
+        }
+
+        HorizontalDivider(color = Rule)
+
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            listOf(
+                Page.JOURNAL to "Journal",
+                Page.TASKS to "Tasks",
+                Page.PROJECTS to "Projects",
+                Page.HISTORY to "History"
+            ).forEach { (destination, label) ->
+                TextButton(onClick = { page = destination }) {
+                    Text(
+                        label,
+                        color = if (page == destination) Ink else Muted,
+                        fontWeight = if (page == destination) FontWeight.Bold
+                        else FontWeight.Normal,
+                        fontSize = 12.sp
+                    )
+                }
+            }
+        }
+    }
+
+    if (showEditor) {
+        EntryEditor(
+            initial = editing,
+            projects = projects,
+            onDismiss = { showEditor = false; editing = null },
+            onSave = { entry ->
+                upsert(entry)
+                showEditor = false
+                editing = null
+            }
+        )
+    }
+
+    if (parentForChild != null) {
+        ChildEditor(
+            onDismiss = { parentForChild = null },
+            onSave = { text ->
+                val parent = parentForChild
+                if (parent != null) {
+                    upsert(parent.copy(children = parent.children + ChildEntry(text = text)))
+                }
                 parentForChild = null
             }
         )
     }
 
-    if (showSearch) {
-        val installedApps = remember(context) {
-            val intent = Intent(Intent.ACTION_MAIN).apply {
-                addCategory(Intent.CATEGORY_LAUNCHER)
-            }
-
-            context.packageManager
-                .queryIntentActivities(intent, 0)
-                .map {
-                    LauncherApp(
-                        name = it.loadLabel(context.packageManager).toString(),
-                        packageName = it.activityInfo.packageName
-                    )
-                }
-                .distinctBy { it.packageName }
-                .sortedBy { it.name.lowercase(Locale.getDefault()) }
-        }
-
-        val matches = installedApps.filter {
-            it.name.contains(searchQuery.trim(), ignoreCase = true)
-        }
-
+    if (actionEntry != null) {
+        val entry = actionEntry!!
         AlertDialog(
-            onDismissRequest = {
-                showSearch = false
-                searchQuery = ""
-            },
-            title = { Text("Find an app") },
+            onDismissRequest = { actionEntry = null },
+            title = { Text("Entry actions") },
             text = {
                 Column {
-                    OutlinedTextField(
-                        value = searchQuery,
-                        onValueChange = { searchQuery = it },
-                        placeholder = { Text("Search installed apps") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                    Text(entry.text, fontWeight = FontWeight.Medium)
+                    Spacer(Modifier.height(12.dp))
+                    TextButton(onClick = {
+                        editing = entry
+                        actionEntry = null
+                        showEditor = true
+                    }) { Text("Edit") }
+                    TextButton(onClick = {
+                        parentForChild = entry
+                        actionEntry = null
+                    }) { Text("Add sub-entry") }
+                    if (entry.type == EntryType.TASK) {
+                        TextButton(onClick = {
+                            showMove = entry
+                            actionEntry = null
+                        }) { Text("Move / organize") }
+                    }
+                    TextButton(onClick = {
+                        deleteEntry = entry
+                        actionEntry = null
+                    }) { Text("Delete") }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { actionEntry = null }) { Text("Cancel") }
+            }
+        )
+    }
 
+    if (showMove != null) {
+        val entry = showMove!!
+        AlertDialog(
+            onDismissRequest = { showMove = null },
+            title = { Text("Move task") },
+            text = {
+                Column {
+                    Text(entry.text, fontWeight = FontWeight.Medium)
                     Spacer(Modifier.height(8.dp))
-
-                    LazyColumn(modifier = Modifier.heightIn(max = 280.dp)) {
-                        items(matches, key = { it.packageName }) { app ->
+                    TaskStatus.values().forEach { status ->
+                        TextButton(
+                            onClick = {
+                                upsert(entry.copy(
+                                    status = status,
+                                    done = status == TaskStatus.DONE
+                                ))
+                                showMove = null
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
                             Text(
-                                app.name,
-                                color = Ink,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable {
-                                        val launchIntent =
-                                            context.packageManager
-                                                .getLaunchIntentForPackage(app.packageName)
-
-                                        if (launchIntent != null) {
-                                            launchIntent.addFlags(
-                                                Intent.FLAG_ACTIVITY_NEW_TASK
-                                            )
-                                            context.startActivity(launchIntent)
-                                            showSearch = false
-                                            searchQuery = ""
-                                        }
-                                    }
-                                    .padding(vertical = 12.dp)
+                                when (status) {
+                                    TaskStatus.INBOX -> "Move to Inbox"
+                                    TaskStatus.NEXT -> "Move to Next"
+                                    TaskStatus.SCHEDULED -> "Move to Scheduled"
+                                    TaskStatus.WAITING -> "Move to Waiting"
+                                    TaskStatus.DONE -> "Move to Done"
+                                },
+                                color = Ink
                             )
                         }
                     }
                 }
             },
             confirmButton = {
+                TextButton(onClick = { showMove = null }) { Text("Cancel") }
+            }
+        )
+    }
+
+    if (deleteEntry != null) {
+        val entry = deleteEntry!!
+        AlertDialog(
+            onDismissRequest = { deleteEntry = null },
+            title = { Text("Delete entry?") },
+            text = {
+                Text("“${entry.text}” and its sub-entries will be permanently deleted.")
+            },
+            confirmButton = {
                 TextButton(onClick = {
-                    showSearch = false
-                    searchQuery = ""
+                    save(entries.filterNot { it.id == entry.id })
+                    deleteEntry = null
+                }) { Text("Delete", color = Ink) }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteEntry = null }) { Text("Cancel") }
+            }
+        )
+    }
+
+    if (pomodoroEntry != null) {
+        AlertDialog(
+            onDismissRequest = {
+                timerRunning = false
+                pomodoroEntry = null
+            },
+            title = { Text("Focus timer") },
+            text = {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(pomodoroEntry!!.text, fontWeight = FontWeight.Medium)
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        "%02d:%02d".format(secondsLeft / 60, secondsLeft % 60),
+                        fontSize = 38.sp,
+                        fontWeight = FontWeight.Light
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        "25-minute focus session",
+                        color = Muted,
+                        fontSize = 12.sp
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    timerRunning = !timerRunning
                 }) {
-                    Text("Close")
+                    Text(if (timerRunning) "Pause" else "Start", color = Ink)
                 }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    timerRunning = false
+                    secondsLeft = 25 * 60
+                }) { Text("Reset") }
             }
+        )
+    }
+
+    if (showApps) {
+        AppSearchDialog(
+            query = searchText,
+            onQueryChange = { searchText = it },
+            onDismiss = { showApps = false; searchText = "" }
         )
     }
 }
 
-private data class LauncherApp(
-    val name: String,
-    val packageName: String
-)
-
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun NotebookTab(
-    label: String,
-    selected: Boolean,
-    onClick: () -> Unit
+private fun JournalRow(
+    entry: Entry,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    onChildToggle: (ChildEntry) -> Unit,
+    onPomodoro: () -> Unit
 ) {
-    Column(
-        modifier = Modifier.clickable(onClick = onClick).padding(vertical = 4.dp)
-    ) {
-        Text(
-            label,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Bold,
-            letterSpacing = 1.2.sp,
-            color = if (selected) Ink else Muted
-        )
-        Spacer(Modifier.height(5.dp))
-        Box(
-            modifier = Modifier
-                .width(62.dp)
-                .height(2.dp)
-                .background(if (selected) Ink else Color.Transparent)
-        )
-    }
-}
-
-@Composable
-private fun JournalEntryRow(
-    entry: JournalEntry,
-    expanded: Boolean,
-    onToggleDone: () -> Unit,
-    onExpand: () -> Unit,
-    onAddChild: () -> Unit,
-    onToggleChild: (SubEntry) -> Unit
-) {
-    val marker = when {
-        entry.type == EntryType.TASK && entry.done -> "×"
-        entry.type == EntryType.TASK -> "•"
-        entry.type == EntryType.EVENT -> "○"
-        else -> "–"
+    val symbol = when (entry.type) {
+        EntryType.TASK -> if (entry.done) "×" else "•"
+        EntryType.NOTE -> "–"
+        EntryType.EVENT -> "○"
     }
 
     Column(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp)
+        modifier = Modifier
+            .fillMaxWidth()
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick
+            )
+            .padding(vertical = 10.dp)
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.Top
-        ) {
-            Text(marker, fontSize = 20.sp, color = Ink, modifier = Modifier.width(25.dp))
-
-            Column(
-                modifier = Modifier.weight(1f).clickable {
-                    if (entry.type == EntryType.TASK) onToggleDone() else onExpand()
+        Row(verticalAlignment = Alignment.Top) {
+            Text(
+                symbol,
+                modifier = Modifier.width(24.dp),
+                fontSize = 22.sp,
+                color = Ink
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        entry.text,
+                        modifier = Modifier.weight(1f),
+                        fontSize = 15.sp,
+                        color = if (entry.done) Muted else Ink,
+                        fontWeight = FontWeight.Normal
+                    )
+                    Text(
+                        entry.time,
+                        fontSize = 11.sp,
+                        color = Muted
+                    )
                 }
-            ) {
-                Text(
-                    entry.text,
-                    fontSize = 15.sp,
-                    lineHeight = 22.sp,
-                    color = if (entry.done) Muted else Ink,
-                    textDecoration = if (entry.done) TextDecoration.LineThrough
-                    else TextDecoration.None
-                )
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "${entry.time} · ${entry.type.name.lowercase().replaceFirstChar { it.uppercase() }}",
-                    fontSize = 11.sp,
-                    color = Muted
-                )
-            }
 
-            if (entry.children.isNotEmpty()) {
-                TextButton(
-                    onClick = onExpand,
-                    contentPadding = PaddingValues(horizontal = 6.dp)
-                ) {
-                    Text(if (expanded) "▾" else "▸", color = Muted)
+                if (entry.details.isNotBlank()) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(entry.details, fontSize = 12.sp, color = Muted)
                 }
-            }
-        }
 
-        if (expanded && entry.children.isNotEmpty()) {
-            Column(modifier = Modifier.padding(start = 25.dp, top = 8.dp)) {
+                if (entry.scheduledDate.isNotBlank()) {
+                    Text(
+                        "Scheduled: ${displayDate(entry.scheduledDate)}",
+                        fontSize = 11.sp,
+                        color = Muted
+                    )
+                }
+
+                if (entry.project.isNotBlank()) {
+                    Text("Project: ${entry.project}", fontSize = 11.sp, color = Muted)
+                }
+
                 entry.children.forEach { child ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable {
-                                if (child.isTask) onToggleChild(child)
-                            }
-                            .padding(vertical = 5.dp),
-                        verticalAlignment = Alignment.Top
+                            .padding(start = 8.dp, top = 7.dp)
+                            .combinedClickable(
+                                onClick = { onChildToggle(child) },
+                                onLongClick = onLongClick
+                            ),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            when {
-                                child.isTask && child.done -> "×"
-                                child.isTask -> "•"
-                                else -> "–"
-                            },
-                            fontSize = 16.sp,
-                            color = Ink,
-                            modifier = Modifier.width(22.dp)
+                            if (child.done) "×" else "◦",
+                            modifier = Modifier.width(20.dp),
+                            color = Muted,
+                            fontSize = 16.sp
                         )
                         Text(
                             child.text,
                             fontSize = 13.sp,
-                            lineHeight = 19.sp,
-                            color = if (child.done) Muted else Ink,
-                            textDecoration = if (child.done) TextDecoration.LineThrough
-                            else TextDecoration.None,
-                            modifier = Modifier.weight(1f)
+                            color = if (child.done) Muted else Ink
                         )
                     }
                 }
 
-                TextButton(
-                    onClick = onAddChild,
-                    contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp)
-                ) {
-                    Text("+ Add sub-task or note", fontSize = 12.sp, color = Muted)
+                if (entry.type == EntryType.TASK) {
+                    TextButton(
+                        onClick = onPomodoro,
+                        contentPadding = PaddingValues(
+                            horizontal = 0.dp,
+                            vertical = 0.dp
+                        )
+                    ) {
+                        Text("▶ 25", fontSize = 10.sp, color = Muted)
+                    }
                 }
-            }
-        } else if (entry.type == EntryType.TASK && entry.children.isEmpty()) {
-            TextButton(
-                onClick = onAddChild,
-                contentPadding = PaddingValues(
-                    start = 25.dp, end = 0.dp, top = 0.dp, bottom = 0.dp
-                )
-            ) {
-                Text("+ Add sub-entry", fontSize = 12.sp, color = Muted)
             }
         }
     }
+    HorizontalDivider(color = Rule, thickness = 0.5.dp)
 }
 
 @Composable
-private fun TaskRow(entry: JournalEntry, onToggle: () -> Unit) {
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Checkbox(checked = entry.done, onCheckedChange = { onToggle() })
-        Text(
-            entry.text,
-            modifier = Modifier.weight(1f),
-            fontSize = 14.sp,
-            color = if (entry.done) Muted else Ink,
-            textDecoration = if (entry.done) TextDecoration.LineThrough
-            else TextDecoration.None
-        )
-    }
-}
-
-@Composable
-private fun AddEntryDialog(
-    title: String,
-    initialType: EntryType,
-    showTypePicker: Boolean,
+private fun EntryEditor(
+    initial: Entry?,
+    projects: List<String>,
     onDismiss: () -> Unit,
-    onSave: (String, EntryType) -> Unit
+    onSave: (Entry) -> Unit
 ) {
-    var text by remember { mutableStateOf("") }
-    var type by remember { mutableStateOf(initialType) }
+    var text by remember(initial?.id) { mutableStateOf(initial?.text ?: "") }
+    var details by remember(initial?.id) { mutableStateOf(initial?.details ?: "") }
+    var type by remember(initial?.id) { mutableStateOf(initial?.type ?: EntryType.TASK) }
+    var status by remember(initial?.id) { mutableStateOf(initial?.status ?: TaskStatus.INBOX) }
+    var date by remember(initial?.id) { mutableStateOf(initial?.scheduledDate ?: "") }
+    var project by remember(initial?.id) { mutableStateOf(initial?.project ?: "") }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(title) },
+        title = { Text(if (initial == null) "New entry" else "Edit entry") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                if (showTypePicker) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        EntryType.values().forEach { option ->
-                            TextButton(onClick = { type = option }) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 480.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    label = { Text("Entry") },
+                    singleLine = true
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = details,
+                    onValueChange = { details = it },
+                    label = { Text("Notes / details") }
+                )
+                Spacer(Modifier.height(8.dp))
+                Text("Type", fontWeight = FontWeight.Medium)
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    EntryType.values().forEach { option ->
+                        FilterChip(
+                            selected = type == option,
+                            onClick = { type = option },
+                            label = {
                                 Text(
-                                    when (option) {
-                                        EntryType.TASK -> "• Task"
-                                        EntryType.NOTE -> "– Note"
-                                        EntryType.EVENT -> "○ Event"
-                                    },
-                                    color = if (type == option) Ink else Muted,
-                                    fontWeight = if (type == option) FontWeight.Bold
-                                    else FontWeight.Normal
+                                    option.name.lowercase()
+                                        .replaceFirstChar { it.uppercase() },
+                                    fontSize = 10.sp
+                                )
+                            }
+                        )
+                    }
+                }
+
+                if (type == EntryType.TASK) {
+                    Text("Task list", fontWeight = FontWeight.Medium)
+                    Column {
+                        TaskStatus.values().forEach { option ->
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                RadioButton(
+                                    selected = status == option,
+                                    onClick = { status = option }
+                                )
+                                Text(
+                                    option.name.lowercase()
+                                        .replaceFirstChar { it.uppercase() },
+                                    fontSize = 13.sp
                                 )
                             }
                         }
                     }
+                    OutlinedTextField(
+                        value = date,
+                        onValueChange = { date = it },
+                        label = { Text("Scheduled date (YYYY-MM-DD)") },
+                        singleLine = true
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = project,
+                        onValueChange = { project = it },
+                        label = { Text("Project (optional)") },
+                        singleLine = true
+                    )
+                    if (projects.isNotEmpty()) {
+                        Text(
+                            "Existing projects: ${projects.joinToString()}",
+                            color = Muted,
+                            fontSize = 11.sp
+                        )
+                    }
                 }
-
-                OutlinedTextField(
-                    value = text,
-                    onValueChange = { text = it },
-                    placeholder = { Text("Write your entry...") },
-                    minLines = 2,
-                    maxLines = 5,
-                    modifier = Modifier.fillMaxWidth()
-                )
             }
         },
         confirmButton = {
             TextButton(
                 enabled = text.isNotBlank(),
-                onClick = { onSave(text.trim(), type) }
-            ) {
-                Text("Add")
-            }
+                onClick = {
+                    val base = initial ?: Entry(text = text.trim())
+                    onSave(
+                        base.copy(
+                            text = text.trim(),
+                            details = details.trim(),
+                            type = type,
+                            status = if (type == EntryType.TASK) status else base.status,
+                            done = if (type == EntryType.TASK)
+                                status == TaskStatus.DONE else base.done,
+                            scheduledDate = date.trim(),
+                            project = project.trim()
+                        )
+                    )
+                }
+            ) { Text("Save", color = Ink) }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Cancel")
-            }
+            TextButton(onClick = onDismiss) { Text("Cancel") }
         }
     )
 }
 
 @Composable
-private fun DividerLine() {
-    Box(
-        modifier = Modifier.fillMaxWidth().height(1.dp).background(Rule)
+private fun ChildEditor(
+    onDismiss: () -> Unit,
+    onSave: (String) -> Unit
+) {
+    var text by remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Add sub-entry") },
+        text = {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                label = { Text("Subtask or note") },
+                singleLine = true
+            )
+        },
+        confirmButton = {
+            TextButton(
+                enabled = text.isNotBlank(),
+                onClick = { onSave(text.trim()) }
+            ) { Text("Add", color = Ink) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}
+
+@Composable
+private fun AppSearchDialog(
+    query: String,
+    onQueryChange: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val apps = remember {
+        val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        context.packageManager.queryIntentActivities(intent, 0)
+            .map {
+                it.loadLabel(context.packageManager).toString() to
+                        it.activityInfo.packageName
+            }
+            .distinctBy { it.second }
+            .sortedBy { it.first.lowercase(Locale.getDefault()) }
+    }
+    val matching = apps.filter { it.first.contains(query, ignoreCase = true) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Find an app") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = query,
+                    onValueChange = onQueryChange,
+                    label = { Text("Search installed apps") },
+                    singleLine = true
+                )
+                Spacer(Modifier.height(8.dp))
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 300.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    matching.take(40).forEach { (name, packageName) ->
+                        TextButton(
+                            onClick = {
+                                val launch = context.packageManager
+                                    .getLaunchIntentForPackage(packageName)
+                                if (launch != null) {
+                                    context.startActivity(launch)
+                                    onDismiss()
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                name,
+                                modifier = Modifier.fillMaxWidth(),
+                                color = Ink
+                            )
+                        }
+                    }
+                    if (matching.isEmpty()) {
+                        Text("No matching apps", color = Muted)
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        }
     )
 }
