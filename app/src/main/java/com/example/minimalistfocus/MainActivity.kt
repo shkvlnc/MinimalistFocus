@@ -1,6 +1,12 @@
 package com.example.minimalistfocus
 
 import android.content.Intent
+import android.net.Uri
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.viewinterop.AndroidView
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.view.View
@@ -44,26 +50,35 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
+import java.io.File
+import java.util.UUID
+import java.util.zip.ZipInputStream
+import org.xmlpull.v1.XmlPullParser
+import org.xmlpull.v1.XmlPullParserFactory
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.unit.dp
 
-private val Paper = Color(0xFFF8F7F2)
+private val Paper = Color(0xFFEDEAE3)
 private val Ink = Color(0xFF242424)
 private val MutedInk = Color(0xFF85837D)
-private val LightLine = Color(0xFFE8E5DC)
+private val LightLine = Color(0xFFD2CFC7)
 
 private const val PREFS = "minimalist_focus_v3"
-private const val DATA_KEY = "journal_lines"
+private const val DATA_KEY = "journal_lines" // legacy key from older versions
+private const val LEGACY_ARCHIVE_KEY = "migrated_legacy_logs"
+private const val MIGRATION_DONE_KEY = "journal_migration_v1_done"
+private const val DAY_KEY_PREFIX = "journal_day_"
+private const val FOLDERS_KEY = "journal_folders_v1"
 private const val DARK_THEME_KEY = "dark_theme_enabled"
-private const val TIMER_DURATION_KEY = "pomodoro_duration_seconds"
-private const val TIMER_RUNNING_KEY = "pomodoro_running"
-private const val TIMER_END_KEY = "pomodoro_end_at"
-private const val TIMER_REMAINING_KEY = "pomodoro_remaining"
+private const val BOOKS_KEY = "epub_books_v1"
 
 private enum class LineStatus(val symbol: String, val label: String) {
     NOTE("—", "Note"), TASK("•", "Task"), NEXT(">", "Next"), DONE("×", "Done"), PARTIAL("◐", "Partial")
@@ -81,6 +96,122 @@ private data class NoteLine(
 )
 
 private data class InstalledApp(val label: String, val packageName: String)
+
+private data class EpubBook(
+    val id: String,
+    val title: String,
+    val author: String,
+    val directory: String,
+    val chapters: List<String>,
+    val currentChapter: Int = 0
+)
+
+private fun loadBooks(prefs: android.content.SharedPreferences): List<EpubBook> = runCatching {
+    val array = JSONArray(prefs.getString(BOOKS_KEY, "[]"))
+    (0 until array.length()).map { i ->
+        val obj = array.getJSONObject(i)
+        val paths = obj.optJSONArray("chapters") ?: JSONArray()
+        EpubBook(
+            id = obj.optString("id"), title = obj.optString("title", "Untitled book"),
+            author = obj.optString("author", "Unknown author"), directory = obj.optString("directory"),
+            chapters = (0 until paths.length()).map { paths.optString(it) },
+            currentChapter = obj.optInt("currentChapter", 0).coerceAtLeast(0)
+        )
+    }
+}.getOrDefault(emptyList())
+
+private fun saveBooks(prefs: android.content.SharedPreferences, books: List<EpubBook>) {
+    val array = JSONArray()
+    books.forEach { book -> array.put(JSONObject().apply {
+        put("id", book.id); put("title", book.title); put("author", book.author)
+        put("directory", book.directory); put("currentChapter", book.currentChapter)
+        put("chapters", JSONArray().apply { book.chapters.forEach { put(it) } })
+    }) }
+    prefs.edit().putString(BOOKS_KEY, array.toString()).apply()
+}
+
+private fun importEpub(context: android.content.Context, uri: Uri): EpubBook {
+    val root = File(context.filesDir, "books").apply { mkdirs() }
+    val id = UUID.randomUUID().toString()
+    val directory = File(root, id).apply { mkdirs() }
+    try {
+        context.contentResolver.openInputStream(uri).use { input ->
+            requireNotNull(input) { "Could not open this file." }
+            ZipInputStream(input).use { zip ->
+                var entry = zip.nextEntry
+                while (entry != null) {
+                    val out = File(directory, entry.name).canonicalFile
+                    require(out.path.startsWith(directory.canonicalPath + File.separator) || out == directory) { "Invalid EPUB path." }
+                    if (entry.isDirectory) out.mkdirs() else {
+                        out.parentFile?.mkdirs()
+                        out.outputStream().use { output ->
+                            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                            while (true) {
+                                val count = zip.read(buffer)
+                                if (count < 0) break
+                                output.write(buffer, 0, count)
+                            }
+                        }
+                    }
+                    zip.closeEntry()
+                    entry = zip.nextEntry
+                }
+            }
+        }
+        val container = File(directory, "META-INF/container.xml")
+        require(container.exists()) { "This file does not look like a valid EPUB." }
+        val containerText = container.readText()
+        val opfRelative = Regex("full-path\\s*=\\s*['\"]([^'\"]+)['\"]").find(containerText)?.groupValues?.get(1)
+            ?: throw IllegalArgumentException("EPUB package file was not found.")
+        val opfFile = File(directory, opfRelative)
+        require(opfFile.exists()) { "EPUB package file is missing." }
+        val opfText = opfFile.readText()
+        val base = opfFile.parentFile ?: directory
+        val manifest = linkedMapOf<String, String>()
+        val parser = XmlPullParserFactory.newInstance().newPullParser()
+        parser.setInput(opfText.reader())
+        var title = "Untitled book"
+        var author = "Unknown author"
+        var spineIds = mutableListOf<String>()
+        var inTitle = false
+        var inCreator = false
+        var event = parser.eventType
+        while (event != XmlPullParser.END_DOCUMENT) {
+            when (event) {
+                XmlPullParser.START_TAG -> when (parser.name.substringAfter(':')) {
+                    "item" -> {
+                        val itemId = parser.getAttributeValue(null, "id")
+                        val href = parser.getAttributeValue(null, "href")
+                        if (!itemId.isNullOrBlank() && !href.isNullOrBlank()) manifest[itemId] = href
+                    }
+                    "itemref" -> parser.getAttributeValue(null, "idref")?.let { spineIds.add(it) }
+                    "title" -> inTitle = true
+                    "creator" -> inCreator = true
+                }
+                XmlPullParser.TEXT -> {
+                    if (inTitle && parser.text.isNotBlank()) title = parser.text.trim()
+                    if (inCreator && parser.text.isNotBlank()) author = parser.text.trim()
+                }
+                XmlPullParser.END_TAG -> when (parser.name.substringAfter(':')) {
+                    "title" -> inTitle = false
+                    "creator" -> inCreator = false
+                }
+            }
+            event = parser.next()
+        }
+        val chapterPaths = spineIds.mapNotNull { manifest[it] }.map { href ->
+            val decoded = Uri.decode(href.substringBefore('#'))
+            val file = File(base, decoded).canonicalFile
+            require(file.path.startsWith(directory.canonicalPath + File.separator)) { "Invalid chapter path." }
+            file.relativeTo(directory).invariantSeparatorsPath
+        }.filter { File(directory, it).exists() }
+        require(chapterPaths.isNotEmpty()) { "No readable chapters were found in this EPUB." }
+        return EpubBook(id, title.ifBlank { "Untitled book" }, author.ifBlank { "Unknown author" }, directory.absolutePath, chapterPaths)
+    } catch (e: Exception) {
+        directory.deleteRecursively()
+        throw e
+    }
+}
 
 class MainActivity : ComponentActivity() {
     @Suppress("DEPRECATION")
@@ -112,9 +243,9 @@ private fun MinimalistFocusScreen() {
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
 
-    fun loadLines(): MutableList<NoteLine> {
+    fun loadLines(storageKey: String): MutableList<NoteLine> {
         val result = mutableListOf<NoteLine>()
-        val raw = prefs.getString(DATA_KEY, null)
+        val raw = prefs.getString(storageKey, null)
         if (!raw.isNullOrBlank()) {
             try {
                 val array = JSONArray(raw)
@@ -133,32 +264,73 @@ private fun MinimalistFocusScreen() {
                 }
             } catch (_: Exception) { result.clear() }
         }
-        if (result.isEmpty()) result.add(newNoteLine())
+        if (result.isEmpty()) result.add(newNoteLine().copy(hasBullet = false))
         return result
     }
 
+    val todayKey = DAY_KEY_PREFIX + SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+    // One-time, non-destructive migration: preserve the old undated journal as a separate archive.
+    remember {
+        if (!prefs.getBoolean(MIGRATION_DONE_KEY, false)) {
+            val oldRaw = prefs.getString(DATA_KEY, null)
+            if (!oldRaw.isNullOrBlank() && prefs.getString(LEGACY_ARCHIVE_KEY, null).isNullOrBlank()) {
+                prefs.edit().putString(LEGACY_ARCHIVE_KEY, oldRaw).apply()
+            }
+            prefs.edit().putBoolean(MIGRATION_DONE_KEY, true).apply()
+        }
+        if (prefs.getString(todayKey, null).isNullOrBlank()) {
+            prefs.edit().putString(todayKey, JSONArray().put(JSONObject().apply {
+                put("id", System.nanoTime()); put("time", SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date()))
+                put("text", ""); put("status", LineStatus.NOTE.name); put("indent", 0)
+                put("hasBullet", false); put("isBold", false); put("showTimestamp", false)
+            }).toString()).apply()
+        }
+        true
+    }
+    var activeJournalKey by remember { mutableStateOf(todayKey) }
     var isDarkTheme by remember { mutableStateOf(prefs.getBoolean(DARK_THEME_KEY, false)) }
     val paper = if (isDarkTheme) Color(0xFF202020) else Paper
     val ink = if (isDarkTheme) Color(0xFFECEBE6) else Ink
     val mutedInk = if (isDarkTheme) Color(0xFFAAA9A2) else MutedInk
     val lightLine = if (isDarkTheme) Color(0xFF44443F) else LightLine
 
-    var lines by remember { mutableStateOf(loadLines()) }
-    var editMode by remember { mutableStateOf(false) }
+    var lines by remember { mutableStateOf(loadLines(todayKey)) }
+    var editMode by remember { mutableStateOf(lines.size == 1 && lines.firstOrNull()?.text.isNullOrBlank()) }
     var activeLineId by remember { mutableLongStateOf(lines.firstOrNull()?.id ?: 0L) }
     var statusLineId by remember { mutableStateOf<Long?>(null) }
     var showAppSearch by remember { mutableStateOf(false) }
-    var currentScreen by remember { mutableIntStateOf(0) } // 0 journal, 1 Pomodoro
+    var showLibraryDrawer by remember { mutableStateOf(false) }
+    var showMigratedLogs by remember { mutableStateOf(false) }
+    var showHistory by remember { mutableStateOf(false) }
+    var showNewFolder by remember { mutableStateOf(false) }
+    var newFolderName by remember { mutableStateOf("") }
+    var folders by remember {
+        mutableStateOf(runCatching {
+            val arr = JSONArray(prefs.getString(FOLDERS_KEY, "[]"))
+            (0 until arr.length()).map { arr.optString(it) }.filter { it.isNotBlank() }
+        }.getOrDefault(emptyList()))
+    }
+    var openedArchiveTitle by remember { mutableStateOf<String?>(null) }
+    var currentScreen by remember { mutableIntStateOf(0) } // 0 journal, 1 books/reader
     var dragTotal by remember { mutableFloatStateOf(0f) }
-    var timerDuration by remember { mutableIntStateOf(prefs.getInt(TIMER_DURATION_KEY, 25 * 60).coerceIn(60, 120 * 60)) }
-    var timerRunning by remember { mutableStateOf(prefs.getBoolean(TIMER_RUNNING_KEY, false)) }
-    var timerEndAt by remember { mutableLongStateOf(prefs.getLong(TIMER_END_KEY, 0L)) }
-    var remainingSeconds by remember {
-        mutableIntStateOf(
-            if (prefs.getBoolean(TIMER_RUNNING_KEY, false) && prefs.getLong(TIMER_END_KEY, 0L) > 0L) {
-                ((prefs.getLong(TIMER_END_KEY, 0L) - System.currentTimeMillis()) / 1000L).toInt().coerceAtLeast(0)
-            } else prefs.getInt(TIMER_REMAINING_KEY, prefs.getInt(TIMER_DURATION_KEY, 25 * 60)).coerceAtLeast(0)
-        )
+    var books by remember { mutableStateOf(loadBooks(prefs)) }
+    var readerBookId by remember { mutableStateOf<String?>(null) }
+    var readerChapter by remember { mutableIntStateOf(0) }
+    var importError by remember { mutableStateOf<String?>(null) }
+    var isImporting by remember { mutableStateOf(false) }
+    val epubPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) scope.launch {
+            isImporting = true
+            val result = runCatching { withContext(Dispatchers.IO) { importEpub(context, uri) } }
+            result.onSuccess { book ->
+                books = books + book
+                saveBooks(prefs, books)
+                readerBookId = book.id
+                readerChapter = 0
+                currentScreen = 1
+            }.onFailure { importError = it.message ?: "Could not import this EPUB." }
+            isImporting = false
+        }
     }
     var pendingFocus by remember { mutableStateOf<Pair<Long, Int>?>(null) }
     val focusRequesters = remember { mutableStateMapOf<Long, FocusRequester>() }
@@ -171,13 +343,27 @@ private fun MinimalistFocusScreen() {
             put("hasBullet", line.hasBullet); put("isBold", line.isBold)
             put("showTimestamp", line.showTimestamp)
         }) }
-        prefs.edit().putString(DATA_KEY, array.toString()).apply()
+        prefs.edit().putString(activeJournalKey, array.toString()).apply()
     }
-    fun saveTimer() {
-        prefs.edit().putInt(TIMER_DURATION_KEY, timerDuration)
-            .putBoolean(TIMER_RUNNING_KEY, timerRunning)
-            .putLong(TIMER_END_KEY, timerEndAt)
-            .putInt(TIMER_REMAINING_KEY, remainingSeconds).apply()
+    fun openStoredJournal(key: String) {
+        activeJournalKey = key
+        lines = loadLines(key)
+        if (lines.size == 1 && lines.first().text.isBlank()) {
+            lines = lines.map { it.copy(hasBullet = false) }.toMutableList()
+            activeLineId = lines.first().id
+            editMode = true
+        } else {
+            activeLineId = lines.firstOrNull()?.id ?: 0L
+            editMode = false
+        }
+        saveLines(lines)
+        showLibraryDrawer = false
+    }
+    fun saveFolders(updated: List<String>) {
+        folders = updated
+        val array = JSONArray()
+        updated.forEach { array.put(it) }
+        prefs.edit().putString(FOLDERS_KEY, array.toString()).apply()
     }
     fun updateLine(id: Long, transform: (NoteLine) -> NoteLine) {
         lines = lines.map { if (it.id == id) transform(it) else it }.toMutableList()
@@ -217,29 +403,6 @@ private fun MinimalistFocusScreen() {
         return true
     }
 
-    // Persist countdown based on an absolute end time; app restarts don't reset a running timer.
-    LaunchedEffect(timerRunning, timerEndAt) {
-        while (timerRunning) {
-            val seconds = ((timerEndAt - System.currentTimeMillis()) / 1000L).toInt().coerceAtLeast(0)
-            remainingSeconds = seconds
-            if (seconds <= 0) {
-                timerRunning = false
-                timerEndAt = 0L
-                remainingSeconds = 0
-                saveTimer()
-                break
-            }
-            delay(250L)
-        }
-    }
-    LaunchedEffect(Unit) {
-        if (timerRunning) {
-            if (remainingSeconds <= 0) {
-                timerRunning = false; timerEndAt = 0L; remainingSeconds = 0; saveTimer()
-            } else saveTimer()
-        }
-    }
-
     Column(
         modifier = Modifier.fillMaxSize().background(paper).statusBarsPadding().imePadding().padding(top = 8.dp, bottom = 8.dp)
             .pointerInput(currentScreen) {
@@ -258,10 +421,15 @@ private fun MinimalistFocusScreen() {
             Column(Modifier.fillMaxSize().padding(horizontal = 18.dp)) {
                 Spacer(Modifier.height(16.dp))
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("☰", fontSize = 24.sp, color = ink,
+                        modifier = Modifier.clickable { showLibraryDrawer = true }.padding(end = 13.dp, top = 8.dp, bottom = 8.dp))
                     Column(Modifier.weight(1f)) {
-                        Text("Today", color = ink, fontSize = 25.sp, fontWeight = FontWeight.Medium)
-                        Text(SimpleDateFormat("EEEE, MMMM d", Locale.getDefault()).format(Date()), color = mutedInk, fontSize = 12.sp)
+                        val isTodayJournal = activeJournalKey == todayKey
+                        Text(if (isTodayJournal) "Journal" else (openedArchiveTitle ?: "Journal"), color = ink, fontSize = 25.sp, fontWeight = FontWeight.Medium)
+                        Text(if (isTodayJournal) SimpleDateFormat("EEEE, MMMM d", Locale.getDefault()).format(Date()) else "Saved journal · read or edit", color = mutedInk, fontSize = 12.sp)
                     }
+                    Text("◷", fontSize = 23.sp, color = ink,
+                        modifier = Modifier.clickable { showHistory = true }.padding(horizontal = 7.dp, vertical = 10.dp))
                     Text(if (isDarkTheme) "☼" else "☾", fontSize = 24.sp, color = ink,
                         modifier = Modifier.clickable {
                             isDarkTheme = !isDarkTheme
@@ -276,6 +444,11 @@ private fun MinimalistFocusScreen() {
                     itemsIndexed(lines, key = { _, line -> line.id }) { _, line ->
                         val requester = remember(line.id) { FocusRequester() }
                         SideEffect { focusRequesters[line.id] = requester }
+                        LaunchedEffect(editMode, line.id) {
+                            if (editMode && line.id == lines.firstOrNull()?.id && line.text.isBlank()) {
+                                requester.requestFocus()
+                            }
+                        }
                         var fieldValue by remember(line.id) { mutableStateOf(TextFieldValue(line.text, selection = TextRange(line.text.length))) }
                         LaunchedEffect(line.text) {
                             if (line.text != fieldValue.text) fieldValue = TextFieldValue(line.text, selection = TextRange(line.text.length))
@@ -295,7 +468,7 @@ private fun MinimalistFocusScreen() {
                             }
                             Row(Modifier.weight(1f).padding(start = (line.indent * 18).dp), verticalAlignment = Alignment.Top) {
                                 Box(Modifier.width(20.dp).padding(top = 1.dp), contentAlignment = Alignment.TopCenter) {
-                                    if (line.hasBullet) Text(
+                                    if (line.hasBullet && line.text.isNotBlank()) Text(
                                         line.status.symbol,
                                         color = if (line.status == LineStatus.DONE) mutedInk else ink,
                                         fontSize = 17.sp,
@@ -366,28 +539,104 @@ private fun MinimalistFocusScreen() {
                 }
             }
         } else {
-            PomodoroScreen(
+            val selectedBook = books.firstOrNull { it.id == readerBookId }
+            BooksScreen(
                 paper = paper, ink = ink, mutedInk = mutedInk, lightLine = lightLine,
-                duration = timerDuration,
-                remaining = remainingSeconds,
-                running = timerRunning,
-                onStartPause = {
-                    if (timerRunning) {
-                        remainingSeconds = ((timerEndAt - System.currentTimeMillis()) / 1000L).toInt().coerceAtLeast(0)
-                        timerRunning = false; timerEndAt = 0L
-                    } else if (remainingSeconds > 0) {
-                        timerEndAt = System.currentTimeMillis() + remainingSeconds * 1000L
-                        timerRunning = true
+                books = books, selectedBook = selectedBook, chapterIndex = readerChapter,
+                importing = isImporting,
+                onImport = { epubPicker.launch(arrayOf("*/*")) },
+                onOpen = { book -> readerBookId = book.id; readerChapter = book.currentChapter.coerceIn(0, (book.chapters.size - 1).coerceAtLeast(0)) },
+                onBackToLibrary = { readerBookId = null },
+                onBackToJournal = { currentScreen = 0 },
+                onChapterChange = { index ->
+                    readerChapter = index.coerceIn(0, (selectedBook?.chapters?.size ?: 1) - 1)
+                    if (selectedBook != null) {
+                        books = books.map { if (it.id == selectedBook.id) it.copy(currentChapter = readerChapter) else it }
+                        saveBooks(prefs, books)
                     }
-                    saveTimer()
                 },
-                onReset = { timerRunning = false; timerEndAt = 0L; remainingSeconds = timerDuration; saveTimer() },
-                onDurationChange = { seconds ->
-                    timerDuration = seconds; timerRunning = false; timerEndAt = 0L; remainingSeconds = seconds; saveTimer()
-                },
-                onBack = { currentScreen = 0 }
+                onDelete = { book ->
+                    File(book.directory).deleteRecursively()
+                    books = books.filterNot { it.id == book.id }
+                    saveBooks(prefs, books)
+                    if (readerBookId == book.id) readerBookId = null
+                }
             )
         }
+    }
+
+    if (showLibraryDrawer) {
+        AlertDialog(
+            onDismissRequest = { showLibraryDrawer = false }, containerColor = paper,
+            title = { Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Library", color = ink, fontSize = 23.sp, modifier = Modifier.weight(1f))
+                Text("×", color = ink, fontSize = 26.sp, modifier = Modifier.clickable { showLibraryDrawer = false }.padding(horizontal = 8.dp))
+            } },
+            text = { Column(Modifier.fillMaxWidth()) {
+                LibraryRow("Today", "Current journal", "▤", ink, mutedInk) { openedArchiveTitle = null; openStoredJournal(todayKey) }
+                LibraryRow("Migrated Logs", "Original entries · undated", "▣", ink, mutedInk) { showLibraryDrawer = false; showMigratedLogs = true }
+                LibraryRow("Journal History", "Browse previous days", "◷", ink, mutedInk) { showLibraryDrawer = false; showHistory = true }
+                LibraryRow("Books", "EPUB reading collection", "▤", ink, mutedInk) { showLibraryDrawer = false; readerBookId = null; currentScreen = 1 }
+                Spacer(Modifier.height(12.dp)); HorizontalDivider(color = lightLine); Spacer(Modifier.height(10.dp))
+                Text("COLLECTIONS", color = mutedInk, fontSize = 11.sp, letterSpacing = 1.5.sp, modifier = Modifier.padding(bottom = 6.dp))
+                if (folders.isEmpty()) Text("No folders yet", color = mutedInk, fontSize = 14.sp, modifier = Modifier.padding(vertical = 8.dp))
+                folders.forEach { folder ->
+                    LibraryRow(folder, "Collection folder", "▰", ink, mutedInk) { showLibraryDrawer = false; openedArchiveTitle = folder; showHistory = false; openStoredJournal("folder_${folder.hashCode()}") }
+                }
+                LibraryRow("New folder", "Create a collection", "+", ink, mutedInk) { newFolderName = ""; showLibraryDrawer = false; showNewFolder = true }
+            } },
+            confirmButton = { TextButton(onClick = { showLibraryDrawer = false }) { Text("Close", color = ink) } }
+        )
+    }
+    if (showNewFolder) {
+        AlertDialog(
+            onDismissRequest = { showNewFolder = false }, containerColor = paper,
+            title = { Text("New folder", color = ink) },
+            text = { OutlinedTextField(value = newFolderName, onValueChange = { newFolderName = it }, singleLine = true, label = { Text("Folder name") }) },
+            confirmButton = { TextButton(onClick = {
+                val name = newFolderName.trim()
+                if (name.isNotEmpty() && folders.none { it.equals(name, ignoreCase = true) }) saveFolders(folders + name)
+                showNewFolder = false
+            }) { Text("Create", color = ink) } },
+            dismissButton = { TextButton(onClick = { showNewFolder = false }) { Text("Cancel", color = ink) } }
+        )
+    }
+    if (showMigratedLogs) {
+        val legacyLines = remember(showMigratedLogs) { parseStoredLines(prefs.getString(LEGACY_ARCHIVE_KEY, null)) }
+        AlertDialog(
+            onDismissRequest = { showMigratedLogs = false }, containerColor = paper,
+            title = { Text("Migrated Logs", color = ink) },
+            text = { if (legacyLines.isEmpty()) Text("No older entries were found.", color = mutedInk) else LazyColumn(Modifier.heightIn(max = 420.dp)) {
+                itemsIndexed(legacyLines, key = { index, line -> "${line.id}_$index" }) { _, line ->
+                    Row(Modifier.fillMaxWidth().padding(vertical = 5.dp), verticalAlignment = Alignment.Top) {
+                        if (line.hasBullet) Text(line.status.symbol, color = ink, modifier = Modifier.width(22.dp))
+                        Text(line.text.ifBlank { "(empty entry)" }, color = ink, fontSize = 15.sp, modifier = Modifier.weight(1f))
+                        if (line.showTimestamp) Text(line.time, color = mutedInk, fontSize = 10.sp)
+                    }
+                }
+            } },
+            confirmButton = { TextButton(onClick = { showMigratedLogs = false }) { Text("Close", color = ink) } }
+        )
+    }
+    if (showHistory) {
+        val dayKeys = remember(showHistory, prefs.all.keys.size) { prefs.all.keys.filter { it.startsWith(DAY_KEY_PREFIX) }.sortedDescending() }
+        AlertDialog(
+            onDismissRequest = { showHistory = false }, containerColor = paper,
+            title = { Text("Journal History", color = ink) },
+            text = { if (dayKeys.isEmpty()) Text("No saved days yet.", color = mutedInk) else LazyColumn(Modifier.heightIn(max = 420.dp)) {
+                itemsIndexed(dayKeys, key = { _, key -> key }) { _, key ->
+                    val datePart = key.removePrefix(DAY_KEY_PREFIX)
+                    val label = runCatching { SimpleDateFormat("EEEE, MMMM d, yyyy", Locale.getDefault()).format(SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(datePart)!!) }.getOrDefault(datePart)
+                    val count = parseStoredLines(prefs.getString(key, null)).count { it.text.isNotBlank() }
+                    LibraryRow(label, "$count entries", "◷", ink, mutedInk) {
+                        openedArchiveTitle = label
+                        showHistory = false
+                        openStoredJournal(key)
+                    }
+                }
+            } },
+            confirmButton = { TextButton(onClick = { showHistory = false }) { Text("Close", color = ink) } }
+        )
     }
 
     val selectedStatusLine = lines.firstOrNull { it.id == statusLineId }
@@ -398,6 +647,12 @@ private fun MinimalistFocusScreen() {
             modifier = Modifier.fillMaxWidth().clickable { updateLine(selectedStatusLine.id) { it.copy(status = status) }; statusLineId = null }.padding(vertical = 9.dp)) } } },
         confirmButton = { TextButton(onClick = { statusLineId = null }) { Text("Cancel", color = ink) } }
     )
+    if (importError != null) AlertDialog(
+        onDismissRequest = { importError = null }, containerColor = paper,
+        title = { Text("Could not import book", color = ink) },
+        text = { Text(importError ?: "", color = ink) },
+        confirmButton = { TextButton(onClick = { importError = null }) { Text("OK", color = ink) } }
+    )
     if (showAppSearch) AppSearchDialog(paper, ink, onDismiss = { showAppSearch = false }, onLaunch = { packageName ->
         context.packageManager.getLaunchIntentForPackage(packageName)?.let { it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); context.startActivity(it) }
         showAppSearch = false
@@ -405,57 +660,185 @@ private fun MinimalistFocusScreen() {
 }
 
 @Composable
-private fun PomodoroScreen(
-    paper: Color,
-    ink: Color,
-    mutedInk: Color,
-    lightLine: Color,
-    duration: Int,
-    remaining: Int,
-    running: Boolean,
-    onStartPause: () -> Unit,
-    onReset: () -> Unit,
-    onDurationChange: (Int) -> Unit,
-    onBack: () -> Unit
-) {
-    val minutes = remaining / 60
-    val seconds = remaining % 60
-    Column(Modifier.fillMaxSize().background(paper).padding(horizontal = 24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        Spacer(Modifier.height(18.dp))
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text("‹", fontSize = 30.sp, color = ink, modifier = Modifier.clickable(onClick = onBack).padding(end = 14.dp))
-            Text("Pomodoro", fontSize = 25.sp, color = ink, fontWeight = FontWeight.Medium)
-            Spacer(Modifier.weight(1f))
-            Text("JOURNAL →", fontSize = 11.sp, color = mutedInk, modifier = Modifier.clickable(onClick = onBack).padding(6.dp))
+private fun LibraryRow(title: String, subtitle: String, symbol: String, ink: Color, mutedInk: Color, onClick: () -> Unit) {
+    Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(symbol, color = ink, fontSize = 21.sp, modifier = Modifier.width(34.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, color = ink, fontSize = 15.sp)
+            Text(subtitle, color = mutedInk, fontSize = 11.sp)
         }
-        Spacer(Modifier.weight(1f))
-        Text(if (running) "FOCUS SESSION" else "FOCUS TIMER", color = mutedInk, fontSize = 12.sp, letterSpacing = 2.sp)
-        Spacer(Modifier.height(20.dp))
-        Text(String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds), color = ink, fontSize = 62.sp, fontWeight = FontWeight.Light)
-        Spacer(Modifier.height(28.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            TimerButton(if (running) "Pause" else "Start", ink, paper, lightLine, onClick = onStartPause, emphasized = true)
-            TimerButton("Reset", ink, paper, lightLine, onClick = onReset)
-        }
-        Spacer(Modifier.height(36.dp))
-        Text("SESSION LENGTH", color = mutedInk, fontSize = 11.sp, letterSpacing = 1.5.sp)
-        Spacer(Modifier.height(12.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf(15, 25, 45, 60).forEach { mins ->
-                TimerButton("${mins}m", ink, paper, lightLine, onClick = { onDurationChange(mins * 60) }, emphasized = duration == mins * 60)
-            }
-        }
-        Spacer(Modifier.weight(1f))
-        Text("SWIPE RIGHT TO RETURN", color = mutedInk, fontSize = 10.sp, letterSpacing = 1.5.sp, modifier = Modifier.padding(bottom = 18.dp))
+        Text("›", color = mutedInk, fontSize = 22.sp)
     }
 }
 
+private fun parseStoredLines(raw: String?): List<NoteLine> {
+    if (raw.isNullOrBlank()) return emptyList()
+    return runCatching {
+        val array = JSONArray(raw)
+        (0 until array.length()).map { i ->
+            val obj = array.getJSONObject(i)
+            NoteLine(
+                id = obj.optLong("id", System.nanoTime() + i), time = obj.optString("time", ""),
+                text = obj.optString("text", ""),
+                status = runCatching { LineStatus.valueOf(obj.optString("status", "NOTE")) }.getOrDefault(LineStatus.NOTE),
+                indent = obj.optInt("indent", 0).coerceIn(0, 8), hasBullet = obj.optBoolean("hasBullet", true),
+                isBold = obj.optBoolean("isBold", false), showTimestamp = obj.optBoolean("showTimestamp", false)
+            )
+        }
+    }.getOrDefault(emptyList())
+}
+
 @Composable
-private fun TimerButton(label: String, ink: Color, paper: Color, lightLine: Color, onClick: () -> Unit, emphasized: Boolean = false) {
-    Text(label, color = ink, fontSize = 15.sp, fontWeight = if (emphasized) FontWeight.SemiBold else FontWeight.Normal,
-        modifier = Modifier.defaultMinSize(minWidth = 58.dp, minHeight = 44.dp)
-            .background(if (emphasized) lightLine else paper, RoundedCornerShape(7.dp))
-            .clickable(onClick = onClick).padding(horizontal = 13.dp, vertical = 12.dp))
+private fun BooksScreen(
+    paper: Color, ink: Color, mutedInk: Color, lightLine: Color,
+    books: List<EpubBook>, selectedBook: EpubBook?, chapterIndex: Int, importing: Boolean,
+    onImport: () -> Unit, onOpen: (EpubBook) -> Unit, onBackToLibrary: () -> Unit,
+    onBackToJournal: () -> Unit, onChapterChange: (Int) -> Unit, onDelete: (EpubBook) -> Unit
+) {
+    var showDeleteId by remember { mutableStateOf<String?>(null) }
+    val chapterPath = selectedBook?.chapters?.getOrNull(chapterIndex)
+    Column(Modifier.fillMaxSize().background(paper).padding(horizontal = 18.dp).padding(top = 12.dp, bottom = 8.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("‹", color = ink, fontSize = 29.sp, modifier = Modifier.clickable {
+                if (selectedBook != null) onBackToLibrary() else onBackToJournal()
+            }.padding(end = 12.dp, top = 4.dp, bottom = 4.dp))
+            Column(Modifier.weight(1f)) {
+                Text(selectedBook?.title ?: "Books", color = ink, fontSize = 23.sp, fontWeight = FontWeight.Medium, maxLines = 1)
+                Text(if (selectedBook != null) selectedBook.author else "EPUB collection", color = mutedInk, fontSize = 12.sp, maxLines = 1)
+            }
+            if (selectedBook == null) Text("+", color = ink, fontSize = 28.sp,
+                modifier = Modifier.clickable(onClick = onImport).padding(horizontal = 8.dp))
+        }
+        Spacer(Modifier.height(10.dp)); HorizontalDivider(color = lightLine)
+        if (selectedBook != null && chapterPath != null) {
+            Spacer(Modifier.height(8.dp))
+            AndroidView(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        settings.javaScriptEnabled = false
+                        settings.allowFileAccess = true
+                        settings.allowContentAccess = false
+                        webViewClient = WebViewClient()
+
+                        setBackgroundColor(
+                            android.graphics.Color.rgb(237, 234, 227)
+                        )
+                    }
+                },
+                update = { webView ->
+                    val chapterFile = File(selectedBook.directory, chapterPath)
+
+                    if (chapterFile.exists()) {
+                        val html = chapterFile.readText()
+
+                        val readerCss = """
+                <style>
+                    body {
+                        background: #EDEAE3;
+                        color: #242424;
+                        font-family: serif;
+                        font-size: 18px;
+                        line-height: 1.65;
+                        padding: 8px 5px 30px;
+                    }
+                    img {
+                        max-width: 100%;
+                        height: auto;
+                    }
+                    table {
+                        max-width: 100%;
+                    }
+                    a {
+                        color: #242424;
+                    }
+                </style>
+            """.trimIndent()
+
+                        val headRegex = Regex("""(?i)<head[^>]*>""")
+
+                        val styled = if (headRegex.containsMatchIn(html)) {
+                            val headMatch = headRegex.find(html)
+                            if (headMatch != null) {
+                                html.replaceRange(
+                                    headMatch.range,
+                                    headMatch.value + readerCss
+                                )
+                            } else {
+                                html
+                            }
+                        } else {
+                            """
+    <html>
+        <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            $readerCss
+        </head>
+        <body>$html</body>
+    </html>
+    """.trimIndent()
+                        }
+
+                        webView.loadDataWithBaseURL(
+                            chapterFile.parentFile?.toURI()?.toString(),
+                            styled,
+                            "text/html",
+                            "UTF-8",
+                            null
+                        )
+                    }
+                }
+            )
+            Spacer(Modifier.height(6.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("${chapterIndex + 1} / ${selectedBook.chapters.size}", color = mutedInk, fontSize = 12.sp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("‹ Previous", color = if (chapterIndex > 0) ink else mutedInk, modifier = Modifier.clickable(enabled = chapterIndex > 0) { onChapterChange(chapterIndex - 1) }.padding(10.dp))
+                    Text("Next ›", color = if (chapterIndex < selectedBook.chapters.lastIndex) ink else mutedInk,
+                        modifier = Modifier.clickable(enabled = chapterIndex < selectedBook.chapters.lastIndex) { onChapterChange(chapterIndex + 1) }.padding(10.dp))
+                }
+            }
+        } else {
+            if (books.isEmpty()) {
+                Spacer(Modifier.weight(1f))
+                Text("No books yet", color = ink, fontSize = 20.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
+                Spacer(Modifier.height(8.dp))
+                Text("Import an EPUB file to read offline.", color = mutedInk, fontSize = 14.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
+                Spacer(Modifier.height(18.dp))
+                Text("＋  IMPORT EPUB", color = ink, fontSize = 13.sp, letterSpacing = 1.sp,
+                    modifier = Modifier.align(Alignment.CenterHorizontally).border(1.dp, lightLine, RoundedCornerShape(8.dp)).clickable(onClick = onImport).padding(horizontal = 18.dp, vertical = 13.dp))
+                Spacer(Modifier.weight(1f))
+            } else {
+                LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(vertical = 8.dp)) {
+                    itemsIndexed(books, key = { _, book -> book.id }) { _, book ->
+                        Row(Modifier.fillMaxWidth().clickable { onOpen(book) }.padding(vertical = 13.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("▤", color = ink, fontSize = 24.sp, modifier = Modifier.width(38.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(book.title, color = ink, fontSize = 16.sp, maxLines = 2)
+                                Text("${book.author} · chapter ${(book.currentChapter + 1).coerceAtMost(book.chapters.size)} of ${book.chapters.size}", color = mutedInk, fontSize = 12.sp)
+                            }
+                            Text("⋯", color = mutedInk, fontSize = 22.sp, modifier = Modifier.clickable { showDeleteId = book.id }.padding(start = 10.dp))
+                        }
+                        HorizontalDivider(color = lightLine)
+                    }
+                }
+                Text(if (importing) "IMPORTING…" else "+  IMPORT EPUB", color = ink, fontSize = 12.sp, letterSpacing = 1.sp,
+                    modifier = Modifier.align(Alignment.CenterHorizontally).clickable(enabled = !importing, onClick = onImport).padding(12.dp))
+            }
+        }
+        Text("SWIPE LEFT TO JOURNAL", color = mutedInk, fontSize = 10.sp, letterSpacing = 1.3.sp,
+            modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 8.dp, bottom = 4.dp))
+    }
+    val deleteBook = books.firstOrNull { it.id == showDeleteId }
+    if (deleteBook != null) AlertDialog(
+        onDismissRequest = { showDeleteId = null }, containerColor = paper,
+        title = { Text("Remove book?", color = ink) },
+        text = { Text("${deleteBook.title} will be removed from this device.", color = ink) },
+        confirmButton = { TextButton(onClick = { onDelete(deleteBook); showDeleteId = null }) { Text("Remove", color = ink) } },
+        dismissButton = { TextButton(onClick = { showDeleteId = null }) { Text("Cancel", color = ink) } }
+    )
 }
 
 private fun newNoteLine(): NoteLine = NoteLine(
@@ -498,3 +881,4 @@ private fun AppSearchDialog(paper: Color, ink: Color, onDismiss: () -> Unit, onL
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close", color = ink) } }
     )
 }
+
